@@ -12,6 +12,10 @@ const DEBUG = process.env.MOBIUS_DEBUG === 'true';
 // Constants
 const USER_AGENT = 'Mobius/2.24; iPhone18,2 Version/26.2; Mobile';
 const RADION_SCALE = 10;
+const RADION_MODELS = [179];
+const VORTECH_MODELS = [147];
+const BASE_POLL_INTERVAL_MS = Math.max(5000, POLL_INTERVAL * 1000);
+const MAX_BACKOFF_MS = Math.max(BASE_POLL_INTERVAL_MS * 4, 5 * 60 * 1000);
 
 const RADION_SENSORS = [
     { key: 'point_intensity', channel: 1, name: 'Point Intensity', unit: '%' },
@@ -31,6 +35,14 @@ const VORTECH_SENSORS = [
 ];
 
 let authCookie = null;
+let mqttConnected = false;
+let shouldPoll = false;
+let pollTimer = null;
+let nextPollDelayMs = BASE_POLL_INTERVAL_MS;
+let currentAvailability = null;
+
+const discoveredRadions = new Set();
+const discoveredVortechs = new Set();
 
 // Logging
 const log = (msg, ...args) => console.log(`[${new Date().toISOString()}] INFO: ${msg}`, ...args);
@@ -71,6 +83,158 @@ function decodePumpPoint(data) {
         error('Pump decode failed:', err);
         return null;
     }
+}
+
+// Utility helpers
+const sanitizeId = (value) => value.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+
+function getDeviceSlug(device) {
+    const serial = device.serialNumber && device.serialNumber.trim();
+    if (serial) {
+        return sanitizeId(serial);
+    }
+    if (device.address && Array.isArray(device.address.bytes)) {
+        return sanitizeId(Buffer.from(device.address.bytes).toString('hex'));
+    }
+    if (device.deviceId) {
+        return sanitizeId(String(device.deviceId));
+    }
+    return `device-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function findDevices(config, modelIds) {
+    const matches = [];
+    (config.tanks || []).forEach((tank) => {
+        (tank.devices || []).forEach((device) => {
+            if (modelIds.includes(device.model)) {
+                matches.push({ device, tank });
+            }
+        });
+    });
+    return matches;
+}
+
+function publishState(topic, payload) {
+    mqttClient.publish(topic, payload, { retain: false });
+}
+
+function publishAvailability(online) {
+    const payload = online ? 'online' : 'offline';
+    if (currentAvailability === payload) return;
+    currentAvailability = payload;
+    mqttClient.publish(`${MQTT_TOPIC_PREFIX}/mobius/status`, payload, { retain: true });
+}
+
+function ensureRadionDiscovery(deviceId, device, tank) {
+    if (discoveredRadions.has(deviceId)) {
+        return;
+    }
+    discoveredRadions.add(deviceId);
+
+    const friendlyName = (device.name && device.name.trim()) || `Radion ${device.serialNumber || deviceId}`;
+    const deviceInfo = {
+        identifiers: [`mobius_radion_${deviceId}`],
+        name: friendlyName,
+        manufacturer: 'EcoTech Marine',
+        model: device.model ? `Model ${device.model}` : undefined,
+        serial_number: device.serialNumber || undefined,
+    };
+    if (tank && tank.name) {
+        deviceInfo.suggested_area = tank.name;
+    }
+
+    RADION_SENSORS.forEach((sensor) => {
+        const topicBase = `${MQTT_TOPIC_PREFIX}/sensor/mobius_radion/${deviceId}/${sensor.key}`;
+        const payload = {
+            name: `${friendlyName} ${sensor.name}`,
+            unique_id: `mobius_radion_${deviceId}_${sensor.key}`,
+            state_topic: `${topicBase}/state`,
+            availability_topic: `${MQTT_TOPIC_PREFIX}/mobius/status`,
+            unit_of_measurement: sensor.unit,
+            device: deviceInfo,
+        };
+        mqttClient.publish(`${topicBase}/config`, JSON.stringify(payload), { retain: true });
+    });
+}
+
+function ensureVortechDiscovery(deviceId, device, tank) {
+    if (discoveredVortechs.has(deviceId)) {
+        return;
+    }
+    discoveredVortechs.add(deviceId);
+
+    const friendlyName = (device.name && device.name.trim()) || `Vortech ${device.serialNumber || deviceId}`;
+    const deviceInfo = {
+        identifiers: [`mobius_vortech_${deviceId}`],
+        name: friendlyName,
+        manufacturer: 'EcoTech Marine',
+        model: device.model ? `Model ${device.model}` : undefined,
+        serial_number: device.serialNumber || undefined,
+    };
+    if (tank && tank.name) {
+        deviceInfo.suggested_area = tank.name;
+    }
+
+    VORTECH_SENSORS.forEach((sensor) => {
+        const topicBase = `${MQTT_TOPIC_PREFIX}/sensor/mobius_vortech/${deviceId}/${sensor.key}`;
+        const payload = {
+            name: `${friendlyName} ${sensor.name}`,
+            unique_id: `mobius_vortech_${deviceId}_${sensor.key}`,
+            state_topic: `${topicBase}/state`,
+            availability_topic: `${MQTT_TOPIC_PREFIX}/mobius/status`,
+            unit_of_measurement: sensor.unit,
+            device: deviceInfo,
+        };
+        mqttClient.publish(`${topicBase}/config`, JSON.stringify(payload), { retain: true });
+    });
+}
+
+function publishRadionState(deviceId, device) {
+    const schedule = device.schedule || {};
+    const points = schedule.points || [];
+    let channels = null;
+
+    if (points.length) {
+        let idx = schedule.lastIndexUsed || 0;
+        idx = Math.max(0, Math.min(idx, points.length - 1));
+        channels = decodeRadionPoint(points[idx].data);
+    }
+
+    RADION_SENSORS.forEach((sensor) => {
+        const topic = `${MQTT_TOPIC_PREFIX}/sensor/mobius_radion/${deviceId}/${sensor.key}/state`;
+        const entry = channels ? channels[sensor.channel] : null;
+        const value = entry && typeof entry.percent === 'number' ? String(entry.percent) : 'unavailable';
+        publishState(topic, value);
+    });
+}
+
+function publishVortechState(deviceId, device) {
+    const schedule = device.schedule || {};
+    const points = schedule.points || [];
+    const speed = points.length ? decodePumpPoint(points[0].data) : null;
+    const mode = (device.vectraInfo && device.vectraInfo.feedModeReturnDelay) ? 'Feed' : 'Run';
+
+    publishState(
+        `${MQTT_TOPIC_PREFIX}/sensor/mobius_vortech/${deviceId}/vortech_speed/state`,
+        speed === null ? 'unavailable' : String(speed),
+    );
+    publishState(
+        `${MQTT_TOPIC_PREFIX}/sensor/mobius_vortech/${deviceId}/vortech_mode/state`,
+        mode,
+    );
+}
+
+function markOfflineDevices(discoveredSet, activeSet, type) {
+    const sensors = type === 'radion' ? RADION_SENSORS : VORTECH_SENSORS;
+    discoveredSet.forEach((deviceId) => {
+        if (activeSet.has(deviceId)) {
+            return;
+        }
+        sensors.forEach((sensor) => {
+            const topic = `${MQTT_TOPIC_PREFIX}/sensor/mobius_${type}/${deviceId}/${sensor.key}/state`;
+            publishState(topic, 'unavailable');
+        });
+    });
 }
 
 // API Functions
@@ -145,6 +309,7 @@ const mqttClient = mqtt.connect(`mqtt://${process.env.MQTT_HOST}:${process.env.M
     username: process.env.MQTT_USERNAME,
     password: process.env.MQTT_PASSWORD,
     clientId: 'mobius-ha-node',
+    reconnectPeriod: 5000,
     will: {
         topic: `${MQTT_TOPIC_PREFIX}/mobius/status`,
         payload: 'offline',
@@ -153,112 +318,94 @@ const mqttClient = mqtt.connect(`mqtt://${process.env.MQTT_HOST}:${process.env.M
 });
 
 mqttClient.on('connect', () => {
+    mqttConnected = true;
     log('MQTT Connected');
-    mqttClient.publish(`${MQTT_TOPIC_PREFIX}/mobius/status`, 'online', { retain: true });
-    publishDiscovery();
+    publishAvailability(true);
     startPolling();
 });
 
 mqttClient.on('error', (err) => {
     error('MQTT Error:', err);
 });
-
-function publishDiscovery() {
-    RADION_SENSORS.forEach(sensor => {
-        const topic = `${MQTT_TOPIC_PREFIX}/sensor/mobius_radion_${sensor.key}/config`;
-        const payload = {
-            name: `Mobius ${sensor.name}`,
-            unique_id: `mobius_radion_${sensor.key}`,
-            state_topic: `${MQTT_TOPIC_PREFIX}/sensor/mobius_radion_${sensor.key}/state`,
-            availability_topic: `${MQTT_TOPIC_PREFIX}/mobius/status`,
-            unit_of_measurement: sensor.unit,
-            device: {
-                identifiers: ['mobius_radion'],
-                name: 'Mobius Radion',
-                manufacturer: 'EcoTech Marine'
-            }
-        };
-        mqttClient.publish(topic, JSON.stringify(payload), { retain: true });
-    });
-
-    VORTECH_SENSORS.forEach(sensor => {
-        const topic = `${MQTT_TOPIC_PREFIX}/sensor/mobius_${sensor.key}/config`;
-        const payload = {
-            name: `Mobius ${sensor.name}`,
-            unique_id: `mobius_${sensor.key}`,
-            state_topic: `${MQTT_TOPIC_PREFIX}/sensor/mobius_${sensor.key}/state`,
-            availability_topic: `${MQTT_TOPIC_PREFIX}/mobius/status`,
-            unit_of_measurement: sensor.unit,
-            device: {
-                identifiers: ['mobius_vortech'],
-                name: 'Mobius Vortech',
-                manufacturer: 'EcoTech Marine'
-            }
-        };
-        mqttClient.publish(topic, JSON.stringify(payload), { retain: true });
-    });
-}
-
-function findDevice(config, modelId) {
-    if (!config.tanks) return null;
-    for (const tank of config.tanks) {
-        if (!tank.devices) continue;
-        for (const device of tank.devices) {
-            if (device.model === modelId) return device;
-        }
-    }
-    return null;
-}
+mqttClient.on('reconnect', () => log('MQTT reconnecting...'));
+mqttClient.on('close', () => handleMqttDisconnect('connection closed'));
+mqttClient.on('offline', () => handleMqttDisconnect('offline'));
 
 async function processConfig(config) {
-    const radion = findDevice(config, 179);
-    const vortech = findDevice(config, 147);
+    const activeRadionIds = new Set();
+    const activeVortechIds = new Set();
 
-    if (radion) {
-        const schedule = radion.schedule || {};
-        const points = schedule.points || [];
-        let idx = schedule.lastIndexUsed || 0;
-        idx = Math.max(0, Math.min(idx, points.length - 1));
-        
-        if (points.length > 0) {
-            const channels = decodeRadionPoint(points[idx].data);
-            RADION_SENSORS.forEach(sensor => {
-                const entry = channels[sensor.channel];
-                const val = entry ? entry.percent : null;
-                const topic = `${MQTT_TOPIC_PREFIX}/sensor/mobius_radion_${sensor.key}/state`;
-                mqttClient.publish(topic, val === null ? 'unavailable' : String(val));
-            });
-        }
+    const radions = findDevices(config, RADION_MODELS);
+    radions.forEach(({ device, tank }) => {
+        const deviceId = getDeviceSlug(device);
+        activeRadionIds.add(deviceId);
+        ensureRadionDiscovery(deviceId, device, tank);
+        publishRadionState(deviceId, device);
+    });
+
+    const vortechs = findDevices(config, VORTECH_MODELS);
+    vortechs.forEach(({ device, tank }) => {
+        const deviceId = getDeviceSlug(device);
+        activeVortechIds.add(deviceId);
+        ensureVortechDiscovery(deviceId, device, tank);
+        publishVortechState(deviceId, device);
+    });
+
+    markOfflineDevices(discoveredRadions, activeRadionIds, 'radion');
+    markOfflineDevices(discoveredVortechs, activeVortechIds, 'vortech');
+}
+
+function scheduleNextPoll(success) {
+    if (!shouldPoll) {
+        return;
     }
-
-    if (vortech) {
-        const schedule = vortech.schedule || {};
-        const points = schedule.points || [];
-        let speed = null;
-        if (points.length > 0) {
-            speed = decodePumpPoint(points[0].data);
-        }
-        const mode = (vortech.vectraInfo && vortech.vectraInfo.feedModeReturnDelay) ? 'Feed' : 'Run';
-
-        mqttClient.publish(`${MQTT_TOPIC_PREFIX}/sensor/mobius_vortech_speed/state`, speed === null ? 'unavailable' : String(speed));
-        mqttClient.publish(`${MQTT_TOPIC_PREFIX}/sensor/mobius_vortech_mode/state`, mode);
-    }
+    nextPollDelayMs = success ? BASE_POLL_INTERVAL_MS : Math.min(nextPollDelayMs * 2, MAX_BACKOFF_MS);
+    debug(`Next poll in ${nextPollDelayMs / 1000}s`);
+    pollTimer = setTimeout(poll, nextPollDelayMs);
 }
 
 async function poll() {
+    if (!shouldPoll) {
+        return;
+    }
     try {
         const config = await fetchConfig();
         await processConfig(config);
-        mqttClient.publish(`${MQTT_TOPIC_PREFIX}/mobius/status`, 'online', { retain: true });
+        publishAvailability(true);
+        nextPollDelayMs = BASE_POLL_INTERVAL_MS;
+        scheduleNextPoll(true);
     } catch (err) {
         error('Polling failed:', err);
-        mqttClient.publish(`${MQTT_TOPIC_PREFIX}/mobius/status`, 'offline', { retain: true });
+        publishAvailability(false);
         authCookie = null; // Clear session on error to force re-login
+        scheduleNextPoll(false);
     }
 }
 
 function startPolling() {
-    poll(); // Initial
-    setInterval(poll, POLL_INTERVAL * 1000);
+    if (shouldPoll) {
+        return;
+    }
+    shouldPoll = true;
+    nextPollDelayMs = BASE_POLL_INTERVAL_MS;
+    poll();
+}
+
+function stopPolling() {
+    shouldPoll = false;
+    if (pollTimer) {
+        clearTimeout(pollTimer);
+        pollTimer = null;
+    }
+}
+
+function handleMqttDisconnect(reason) {
+    if (!mqttConnected) {
+        return;
+    }
+    mqttConnected = false;
+    log(`MQTT ${reason}, stopping polls`);
+    publishAvailability(false);
+    stopPolling();
 }
 

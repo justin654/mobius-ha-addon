@@ -1,6 +1,6 @@
 name: Mobius Entities
 slug: mobius_entities
-version: "0.2.0"
+version: "0.2.1"
 description: Publishes EcoTech Mobius light and pump data as Home Assistant entities
 authors:
   - Justin's Mobius Lab
