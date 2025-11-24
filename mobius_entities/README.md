@@ -2,6 +2,8 @@
 
 Bridge EcoTech Mobius data into Home Assistant without running the full web dashboard. The add-on logs into Mobius cloud, pulls the same `config.json` the app uses, decodes Radion/Vortech data, and publishes MQTT discovery payloads so sensors appear automatically.
 
+[![Add to Home Assistant](https://my.home-assistant.io/badges/supervisor_add_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fjustin654%2Fmobius-ha-addon)
+
 ## What you get
 - **Radion coverage** – Every light found in your Mobius account exposes the full set of LED channel percentages plus an availability sensor. Entities follow the pattern `sensor.mobius_radion_<device>_<channel>`.
 - **Vortech coverage** – Each pump reports the current speed percentage and whether it’s in Feed or Run mode.
