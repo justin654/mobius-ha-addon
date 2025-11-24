@@ -1,0 +1,11 @@
+{
+  "name": "mobius-ha-bridge",
+  "version": "1.0.0",
+  "description": "Node.js bridge for Mobius to Home Assistant MQTT",
+  "main": "index.js",
+  "dependencies": {
+    "mqtt": "^5.3.5",
+    "node-fetch": "^2.7.0"
+  }
+}
+

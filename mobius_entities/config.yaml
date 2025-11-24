@@ -1,0 +1,34 @@
+name: Mobius Entities
+slug: mobius_entities
+version: "0.2.0"
+description: Publishes EcoTech Mobius light and pump data as Home Assistant entities
+authors:
+  - Justin's Mobius Lab
+arch:
+  - aarch64
+  - amd64
+  - armv7
+  - armhf
+startup: services
+boot: auto
+init: false
+panel_icon: mdi:fishbowl
+homeassistant_api: true
+services:
+  - mqtt:need
+options:
+  email: ""
+  password: ""
+  base_url: "https://cloud.mobius.app"
+  poll_interval: 60
+  mqtt_topic_prefix: "homeassistant"
+  debug_logging: false
+schema:
+  email: str
+  password: password
+  base_url: url?
+  poll_interval: int(30,600)?
+  mqtt_topic_prefix: str?
+  debug_logging: bool?
+map: []
+apparmor: false
