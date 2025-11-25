@@ -88,6 +88,32 @@ function decodePumpPoint(data) {
 // Utility helpers
 const sanitizeId = (value) => value.toLowerCase().replace(/[^a-z0-9]+/g, '-');
 
+function getCurrentMinutes() {
+    const now = new Date();
+    return now.getHours() * 60 + now.getMinutes() + now.getSeconds() / 60;
+}
+
+function selectSchedulePoint(points) {
+    if (!Array.isArray(points) || points.length === 0) {
+        return null;
+    }
+    const sorted = [...points].sort((a, b) => (a.time ?? 0) - (b.time ?? 0));
+    const minutes = getCurrentMinutes();
+
+    let selected = sorted[sorted.length - 1];
+    for (const point of sorted) {
+        if (typeof point.time !== 'number') {
+            continue;
+        }
+        if (minutes >= point.time) {
+            selected = point;
+        } else {
+            break;
+        }
+    }
+    return selected;
+}
+
 function getDeviceSlug(device) {
     const serial = device.serialNumber && device.serialNumber.trim();
     if (serial) {
@@ -194,10 +220,9 @@ function publishRadionState(deviceId, device) {
     const points = schedule.points || [];
     let channels = null;
 
-    if (points.length) {
-        let idx = schedule.lastIndexUsed || 0;
-        idx = Math.max(0, Math.min(idx, points.length - 1));
-        channels = decodeRadionPoint(points[idx].data);
+    const point = selectSchedulePoint(points);
+    if (point && point.data) {
+        channels = decodeRadionPoint(point.data);
     }
 
     RADION_SENSORS.forEach((sensor) => {
@@ -211,7 +236,8 @@ function publishRadionState(deviceId, device) {
 function publishVortechState(deviceId, device) {
     const schedule = device.schedule || {};
     const points = schedule.points || [];
-    const speed = points.length ? decodePumpPoint(points[0].data) : null;
+    const point = selectSchedulePoint(points);
+    const speed = point && point.data ? decodePumpPoint(point.data) : null;
     const mode = (device.vectraInfo && device.vectraInfo.feedModeReturnDelay) ? 'Feed' : 'Run';
 
     publishState(
