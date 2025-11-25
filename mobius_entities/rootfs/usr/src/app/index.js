@@ -43,6 +43,7 @@ let currentAvailability = null;
 
 const discoveredRadions = new Set();
 const discoveredVortechs = new Set();
+const fallbackSlugCache = new Map();
 
 // Logging
 const log = (msg, ...args) => console.log(`[${new Date().toISOString()}] INFO: ${msg}`, ...args);
@@ -97,24 +98,27 @@ function selectSchedulePoint(points) {
     if (!Array.isArray(points) || points.length === 0) {
         return null;
     }
-    const sorted = [...points].sort((a, b) => (a.time ?? 0) - (b.time ?? 0));
+
+    const validPoints = points.filter((point) => typeof point.time === 'number');
+    if (validPoints.length === 0) {
+        return null;
+    }
+
+    const sorted = [...validPoints].sort((a, b) => a.time - b.time);
     const minutes = getCurrentMinutes();
 
-    let selected = sorted[sorted.length - 1];
+    // Default to the first point so times earlier than the first slot don't roll to the previous day
+    let selected = sorted[0];
     for (const point of sorted) {
-        if (typeof point.time !== 'number') {
-            continue;
-        }
-        if (minutes >= point.time) {
-            selected = point;
-        } else {
+        if (minutes < point.time) {
             break;
         }
+        selected = point;
     }
     return selected;
 }
 
-function getDeviceSlug(device) {
+function getDeviceSlug(device, fallbackKey) {
     const serial = device.serialNumber && device.serialNumber.trim();
     if (serial) {
         return sanitizeId(serial);
@@ -125,15 +129,32 @@ function getDeviceSlug(device) {
     if (device.deviceId) {
         return sanitizeId(String(device.deviceId));
     }
-    return `device-${Math.random().toString(36).slice(2, 10)}`;
+    if (device.name && device.name.trim()) {
+        return sanitizeId(device.name.trim());
+    }
+    if (fallbackKey) {
+        if (!fallbackSlugCache.has(fallbackKey)) {
+            fallbackSlugCache.set(
+                fallbackKey,
+                `device-${fallbackSlugCache.size + 1}`,
+            );
+        }
+        return fallbackSlugCache.get(fallbackKey);
+    }
+    return `device-unknown`;
 }
 
 function findDevices(config, modelIds) {
     const matches = [];
-    (config.tanks || []).forEach((tank) => {
-        (tank.devices || []).forEach((device) => {
+    (config.tanks || []).forEach((tank, tankIndex) => {
+        (tank.devices || []).forEach((device, deviceIndex) => {
             if (modelIds.includes(device.model)) {
-                matches.push({ device, tank });
+                matches.push({
+                    device,
+                    tank,
+                    tankIndex,
+                    deviceIndex,
+                });
             }
         });
     });
@@ -362,16 +383,16 @@ async function processConfig(config) {
     const activeVortechIds = new Set();
 
     const radions = findDevices(config, RADION_MODELS);
-    radions.forEach(({ device, tank }) => {
-        const deviceId = getDeviceSlug(device);
+    radions.forEach(({ device, tank, tankIndex, deviceIndex }) => {
+        const deviceId = getDeviceSlug(device, `radion-${tankIndex}-${deviceIndex}`);
         activeRadionIds.add(deviceId);
         ensureRadionDiscovery(deviceId, device, tank);
         publishRadionState(deviceId, device);
     });
 
     const vortechs = findDevices(config, VORTECH_MODELS);
-    vortechs.forEach(({ device, tank }) => {
-        const deviceId = getDeviceSlug(device);
+    vortechs.forEach(({ device, tank, tankIndex, deviceIndex }) => {
+        const deviceId = getDeviceSlug(device, `vortech-${tankIndex}-${deviceIndex}`);
         activeVortechIds.add(deviceId);
         ensureVortechDiscovery(deviceId, device, tank);
         publishVortechState(deviceId, device);
