@@ -9,6 +9,12 @@ const POLL_INTERVAL = parseInt(process.env.MOBIUS_POLL_INTERVAL || '60', 10);
 const MQTT_TOPIC_PREFIX = (process.env.MQTT_TOPIC_PREFIX || 'homeassistant').replace(/\/$/, '');
 const DEBUG = process.env.MOBIUS_DEBUG === 'true';
 
+// Validate required configuration
+if (!MOBIUS_EMAIL || !MOBIUS_PASSWORD) {
+    console.error('[ERROR] MOBIUS_EMAIL and MOBIUS_PASSWORD must be configured in add-on options');
+    process.exit(1);
+}
+
 // Constants
 const USER_AGENT = 'Mobius/2.24; iPhone18,2 Version/26.2; Mobile';
 const RADION_SCALE = 10;
@@ -197,9 +203,11 @@ function ensureRadionDiscovery(deviceId, device, tank) {
             unique_id: `mobius_radion_${deviceId}_${sensor.key}`,
             state_topic: `${topicBase}/state`,
             availability_topic: `${MQTT_TOPIC_PREFIX}/mobius/status`,
-            unit_of_measurement: sensor.unit,
             device: deviceInfo,
         };
+        if (sensor.unit) {
+            payload.unit_of_measurement = sensor.unit;
+        }
         mqttClient.publish(`${topicBase}/config`, JSON.stringify(payload), { retain: true });
     });
 }
@@ -229,9 +237,11 @@ function ensureVortechDiscovery(deviceId, device, tank) {
             unique_id: `mobius_vortech_${deviceId}_${sensor.key}`,
             state_topic: `${topicBase}/state`,
             availability_topic: `${MQTT_TOPIC_PREFIX}/mobius/status`,
-            unit_of_measurement: sensor.unit,
             device: deviceInfo,
         };
+        if (sensor.unit) {
+            payload.unit_of_measurement = sensor.unit;
+        }
         mqttClient.publish(`${topicBase}/config`, JSON.stringify(payload), { retain: true });
     });
 }
@@ -259,7 +269,14 @@ function publishVortechState(deviceId, device) {
     const points = schedule.points || [];
     const point = selectSchedulePoint(points);
     const speed = point && point.data ? decodePumpPoint(point.data) : null;
-    const mode = (device.vectraInfo && device.vectraInfo.feedModeReturnDelay) ? 'Feed' : 'Run';
+
+    // Note: vectraInfo.feedModeReturnDelay is a configuration value (seconds until return from feed mode),
+    // not necessarily the current operational state. The Mobius config.json may not expose real-time pump mode.
+    // This reports "Feed" if feed mode is configured (feedModeReturnDelay > 0), otherwise "Run".
+    let mode = 'Run';
+    if (device.vectraInfo && typeof device.vectraInfo.feedModeReturnDelay === 'number' && device.vectraInfo.feedModeReturnDelay > 0) {
+        mode = 'Feed';
+    }
 
     publishState(
         `${MQTT_TOPIC_PREFIX}/sensor/mobius_vortech/${deviceId}/vortech_speed/state`,
@@ -419,7 +436,6 @@ async function poll() {
         const config = await fetchConfig();
         await processConfig(config);
         publishAvailability(true);
-        nextPollDelayMs = BASE_POLL_INTERVAL_MS;
         scheduleNextPoll(true);
     } catch (err) {
         error('Polling failed:', err);
@@ -452,7 +468,7 @@ function handleMqttDisconnect(reason) {
     }
     mqttConnected = false;
     log(`MQTT ${reason}, stopping polls`);
-    publishAvailability(false);
+    // Note: MQTT will message automatically publishes 'offline' on disconnect
     stopPolling();
 }
 
